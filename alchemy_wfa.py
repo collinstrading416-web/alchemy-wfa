@@ -707,18 +707,27 @@ def walk_forward(df: pd.DataFrame, train_mo: int, blind_mo: int,
 # DATA LOADER
 # ─────────────────────────────────────────────────────────────────────────────
 
-def load_csv(uploaded) -> pd.DataFrame:
+def load_csv(uploaded, tz_mode: str = "mt4_utc3") -> pd.DataFrame:
     """
-    Parse MT4 history export CSV (handles multiple formats).
+    Parse an intraday history CSV — handles MT4 exports and Barchart.com exports.
 
     MT4 exports with NO header row (first char is a digit):
         Date, Time, Open, High, Low, Close, Volume  — broker time UTC+3
     MT4 exports WITH a header row:
         <DATE>,<TIME>,<OPEN>,<HIGH>,<LOW>,<CLOSE>,<VOL>  — or similar
+    Barchart.com intraday exports:
+        Time,Open,High,Low,Latest,Change,%Change,Volume  — plus a trailing
+        "Downloaded from Barchart.com as of ..." footer line with no data.
 
-    CRITICAL: MT4 broker time is UTC+3.  We localize as UTC+3 so that
-    downstream tz_convert("America/New_York") produces correct ET times.
-    e.g. broker 16:30 UTC+3 → 13:30 UTC → 09:30 ET  ✓
+    Any row whose timestamp can't be parsed (stray footers, repeated header
+    rows, blank lines) is dropped rather than raising.
+
+    tz_mode controls how the raw timestamps are localized before everything
+    downstream converts via tz_convert("America/New_York"):
+      "mt4_utc3" — MT4 broker time, fixed UTC+3 offset (MT4 standard)
+      "et"       — timestamps are already US/Eastern (Barchart default)
+      "ct"       — timestamps are US/Central
+      "utc"      — timestamps are UTC
     """
     raw   = uploaded.read().decode("utf-8", errors="ignore")
     lines = [l for l in raw.splitlines() if l.strip()]
@@ -739,7 +748,7 @@ def load_csv(uploaded) -> pd.DataFrame:
             elif "OPEN"  in cu: remap[c] = "Open"
             elif "HIGH"  in cu: remap[c] = "High"
             elif "LOW"   in cu: remap[c] = "Low"
-            elif "CLOSE" in cu: remap[c] = "Close"
+            elif "CLOSE" in cu or "LATEST" in cu: remap[c] = "Close"   # Barchart uses "Latest"
             elif "VOL"   in cu or "TICK" in cu: remap[c] = "Volume"
         df.rename(columns=remap, inplace=True)
     else:
@@ -747,21 +756,31 @@ def load_csv(uploaded) -> pd.DataFrame:
         col_names = ["Date", "Time", "Open", "High", "Low", "Close", "Volume"]
         df = pd.read_csv(io.StringIO(raw), sep=sep, header=None, names=col_names)
 
-    # Build DatetimeIndex
+    # Build DatetimeIndex — coerce unparsable rows (footers, stray headers,
+    # blank rows) to NaT instead of blowing up the whole parse, then drop them.
     if "Datetime" in df.columns:
-        df.index = pd.to_datetime(df["Datetime"])
+        idx = pd.to_datetime(df["Datetime"], errors="coerce")
     elif "Date" in df.columns and "Time" in df.columns:
-        df.index = pd.to_datetime(df["Date"].astype(str) + " " + df["Time"].astype(str))
+        idx = pd.to_datetime(df["Date"].astype(str) + " " + df["Time"].astype(str), errors="coerce")
     else:
-        df.index = pd.to_datetime(df.iloc[:, 0])
+        idx = pd.to_datetime(df.iloc[:, 0], errors="coerce")
+    df.index = idx
+    df = df[df.index.notna()]
 
     want = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in df.columns]
     df   = df[want].apply(pd.to_numeric, errors="coerce").dropna().sort_index()
 
-    # Localize as broker UTC+3 (NOT UTC) so ET conversion is correct
+    # Localize per tz_mode (NOT always UTC+3) so ET conversion is correct
     if df.index.tz is None:
-        broker_tz = pytz.FixedOffset(180)   # UTC+3
-        df.index  = df.index.tz_localize(broker_tz)
+        if tz_mode == "et":
+            df.index = df.index.tz_localize("America/New_York", ambiguous="NaT", nonexistent="shift_forward")
+        elif tz_mode == "ct":
+            df.index = df.index.tz_localize("America/Chicago",  ambiguous="NaT", nonexistent="shift_forward")
+        elif tz_mode == "utc":
+            df.index = df.index.tz_localize("UTC")
+        else:  # "mt4_utc3" — MT4 broker time
+            df.index = df.index.tz_localize(pytz.FixedOffset(180))
+        df = df[df.index.notna()]   # drop rare DST-fold ambiguous rows
 
     df.index.name = "Datetime"
     return df
@@ -781,11 +800,23 @@ def main():
 
         # Data
         st.subheader("📊 Data")
-        src = st.radio("Source", ["Upload MT4 CSV", "yfinance NQ=F (60-day limit)"])
+        src = st.radio("Source", ["Upload CSV (MT4 / Barchart)", "yfinance NQ=F (60-day limit)"])
         uploaded = None
-        if src == "Upload MT4 CSV":
-            st.caption("MT4 → Tools → History Center → NDX100,M1 → Export")
-            uploaded = st.file_uploader("NDX100 M1 CSV", type=["csv","txt"])
+        tz_mode  = "mt4_utc3"
+        if src == "Upload CSV (MT4 / Barchart)":
+            st.caption("MT4 → Tools → History Center → NDX100,M1 → Export, "
+                       "or a Barchart.com intraday history download")
+            uploaded = st.file_uploader("Intraday M1 CSV", type=["csv","txt"])
+            tz_label = st.selectbox(
+                "CSV timestamp timezone",
+                ["MT4 broker (UTC+3)", "US Eastern (ET)", "US Central (CT)", "UTC"],
+                index=0,
+                help="What timezone are the raw timestamps in your file already in? "
+                     "MT4 exports are broker time (usually UTC+3). Barchart.com intraday "
+                     "exports are typically Eastern Time — check the download page if unsure.",
+            )
+            tz_mode = {"MT4 broker (UTC+3)": "mt4_utc3", "US Eastern (ET)": "et",
+                       "US Central (CT)": "ct", "UTC": "utc"}[tz_label]
         else:
             st.info("NQ=F at 5m — limited history but works for quick tests")
 
@@ -867,11 +898,11 @@ def main():
     # ── LOAD DATA ─────────────────────────────────────────────────────────────
     with st.spinner("Loading data…"):
         try:
-            if src == "Upload MT4 CSV":
+            if src == "Upload CSV (MT4 / Barchart)":
                 if uploaded is None:
-                    st.error("Please upload an MT4 CSV file.")
+                    st.error("Please upload a CSV file.")
                     return
-                data = load_csv(uploaded)
+                data = load_csv(uploaded, tz_mode)
             else:
                 import yfinance as yf
                 raw  = yf.Ticker("NQ=F").history(period="60d", interval="5m")
