@@ -157,6 +157,7 @@ def run_alchemy(df: pd.DataFrame, p: dict) -> pd.DataFrame:
     h1_cls_d    = h1_cls_s.to_dict() if h1_cls_s is not None else {}
 
     trades = []
+    prev_close = None
 
     for day, day_df in data.groupby(data.index.date):
 
@@ -172,6 +173,11 @@ def run_alchemy(df: pd.DataFrame, p: dict) -> pd.DataFrame:
         or_hi  = or_bars["High"].max()
         or_lo  = or_bars["Low"].min()
         or_rng = or_hi - or_lo
+
+        # Session context
+        day_of_week = pd.Timestamp(day).weekday()
+        gap_pts     = round(float(or_bars["Open"].iloc[0]) - prev_close, 2) \
+                      if prev_close is not None else 0.0
 
         # ── Gate 9: OR range minimum ───────────────────────────────────────
         if or_rng < min_or:
@@ -245,12 +251,16 @@ def run_alchemy(df: pd.DataFrame, p: dict) -> pd.DataFrame:
                         sl_p = entry - sl_pts
                         tp_p = entry + tp_pts
                         pnl, xt, xr = _scan_exit(day_df, ts, "LONG", sl_p, tp_p, sl_pts, tp_pts, lot, dpp, spread_pts)
+                        retest_min = ts.hour * 60 + ts.minute - (9 * 60 + 45)
                         trades.append({
                             "date": day, "entry_time": ts, "exit_time": xt,
                             "direction": "LONG", "entry": round(entry, 2),
                             "sl": round(sl_p, 2), "tp": round(tp_p, 2),
                             "or_high": round(or_hi, 2), "or_low": round(or_lo, 2),
                             "or_range": round(or_rng, 2),
+                            "day_of_week": day_of_week, "gap_pts": gap_pts,
+                            "retest_min": retest_min,
+                            "adx_val": round(adx_d.get(ts, 0.0), 1),
                             "profit": round(pnl, 2), "exit_reason": xr,
                         })
                         daily_trades += 1
@@ -267,19 +277,27 @@ def run_alchemy(df: pd.DataFrame, p: dict) -> pd.DataFrame:
                         sl_p = entry + sl_pts
                         tp_p = entry - tp_pts
                         pnl, xt, xr = _scan_exit(day_df, ts, "SHORT", sl_p, tp_p, sl_pts, tp_pts, lot, dpp, spread_pts)
+                        retest_min = ts.hour * 60 + ts.minute - (9 * 60 + 45)
                         trades.append({
                             "date": day, "entry_time": ts, "exit_time": xt,
                             "direction": "SHORT", "entry": round(entry, 2),
                             "sl": round(sl_p, 2), "tp": round(tp_p, 2),
                             "or_high": round(or_hi, 2), "or_low": round(or_lo, 2),
                             "or_range": round(or_rng, 2),
+                            "day_of_week": day_of_week, "gap_pts": gap_pts,
+                            "retest_min": retest_min,
+                            "adx_val": round(adx_d.get(ts, 0.0), 1),
                             "profit": round(pnl, 2), "exit_reason": xr,
                         })
                         daily_trades += 1
                         or1_short_done = True
 
+        prev_close = float(day_df["Close"].iloc[-1])
+
     cols = ["date","entry_time","exit_time","direction","entry","sl","tp",
-            "or_high","or_low","or_range","profit","exit_reason"]
+            "or_high","or_low","or_range",
+            "day_of_week","gap_pts","retest_min","adx_val",
+            "profit","exit_reason"]
     return pd.DataFrame(trades, columns=cols) if trades else pd.DataFrame(columns=cols)
 
 
@@ -686,6 +704,10 @@ def walk_forward(df: pd.DataFrame, train_mo: int, blind_mo: int,
 
         prog.info(f"🔍 Fold {fn} — blind test {bs} → {be} ...")
         bl_tr  = run_alchemy(bl_df, best_p)
+        if not bl_tr.empty:
+            bl_tr["is_oos"]    = True
+            bl_tr["fold"]      = fn
+            bl_tr["fold_params"] = str(best_p)
         bl_m   = metrics(bl_tr)
 
         folds.append({
@@ -707,33 +729,14 @@ def walk_forward(df: pd.DataFrame, train_mo: int, blind_mo: int,
 # DATA LOADER
 # ─────────────────────────────────────────────────────────────────────────────
 
-def load_csv(uploaded, tz_mode: str = "mt4_utc3") -> pd.DataFrame:
+def load_csv(uploaded) -> pd.DataFrame:
     """
-    Parse an intraday history CSV — handles MT4 exports and Barchart.com exports.
-
-    MT4 exports with NO header row (first char is a digit):
-        Date, Time, Open, High, Low, Close, Volume  — broker time UTC+3
-    MT4 exports WITH a header row:
-        <DATE>,<TIME>,<OPEN>,<HIGH>,<LOW>,<CLOSE>,<VOL>  — or similar
-    Barchart.com intraday exports:
-        Time,Open,High,Low,Latest,Change,%Change,Volume  — plus a trailing
-        "Downloaded from Barchart.com as of ..." footer line with no data.
-
-    Any row whose timestamp can't be parsed (stray footers, repeated header
-    rows, blank lines) is dropped rather than raising.
-
-    tz_mode controls how the raw timestamps are localized before everything
-    downstream converts via tz_convert("America/New_York"):
-      "mt4_utc3" — MT4 broker time, fixed UTC+3 offset (MT4 standard)
-      "et"       — timestamps are already US/Eastern (Barchart default)
-      "ct"       — timestamps are US/Central
-      "utc"      — timestamps are UTC
+    Parse M1 CSV - supports MT4 and Dukascopy formats.
+    MT4: no header, broker UTC+3. Dukascopy: has header with UTC timestamps.
     """
     raw   = uploaded.read().decode("utf-8", errors="ignore")
     lines = [l for l in raw.splitlines() if l.strip()]
     sep   = "," if "," in lines[0] else "\t"
-
-    # Detect header: if the very first character is a digit, there is no header
     has_header = not lines[0][0].isdigit()
 
     if has_header:
@@ -744,43 +747,30 @@ def load_csv(uploaded, tz_mode: str = "mt4_utc3") -> pd.DataFrame:
             cu = c.upper()
             if   "DATE" in cu and "TIME" not in cu: remap[c] = "Date"
             elif "TIME" in cu and "DATE" not in cu: remap[c] = "Time"
-            elif cu in ("DATETIME", "TIMESTAMP"):    remap[c] = "Datetime"
+            elif cu in ("DATETIME", "TIMESTAMP"):   remap[c] = "Datetime"
             elif "OPEN"  in cu: remap[c] = "Open"
             elif "HIGH"  in cu: remap[c] = "High"
             elif "LOW"   in cu: remap[c] = "Low"
-            elif "CLOSE" in cu or "LATEST" in cu: remap[c] = "Close"   # Barchart uses "Latest"
+            elif "CLOSE" in cu: remap[c] = "Close"
             elif "VOL"   in cu or "TICK" in cu: remap[c] = "Volume"
         df.rename(columns=remap, inplace=True)
     else:
-        # No header — MT4 standard export: Date,Time,Open,High,Low,Close,Volume
         col_names = ["Date", "Time", "Open", "High", "Low", "Close", "Volume"]
         df = pd.read_csv(io.StringIO(raw), sep=sep, header=None, names=col_names)
 
-    # Build DatetimeIndex — coerce unparsable rows (footers, stray headers,
-    # blank rows) to NaT instead of blowing up the whole parse, then drop them.
     if "Datetime" in df.columns:
-        idx = pd.to_datetime(df["Datetime"], errors="coerce")
+        df.index = pd.to_datetime(df["Datetime"])
     elif "Date" in df.columns and "Time" in df.columns:
-        idx = pd.to_datetime(df["Date"].astype(str) + " " + df["Time"].astype(str), errors="coerce")
+        df.index = pd.to_datetime(df["Date"].astype(str) + " " + df["Time"].astype(str))
     else:
-        idx = pd.to_datetime(df.iloc[:, 0], errors="coerce")
-    df.index = idx
-    df = df[df.index.notna()]
+        df.index = pd.to_datetime(df.iloc[:, 0])
 
     want = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in df.columns]
     df   = df[want].apply(pd.to_numeric, errors="coerce").dropna().sort_index()
 
-    # Localize per tz_mode (NOT always UTC+3) so ET conversion is correct
     if df.index.tz is None:
-        if tz_mode == "et":
-            df.index = df.index.tz_localize("America/New_York", ambiguous="NaT", nonexistent="shift_forward")
-        elif tz_mode == "ct":
-            df.index = df.index.tz_localize("America/Chicago",  ambiguous="NaT", nonexistent="shift_forward")
-        elif tz_mode == "utc":
-            df.index = df.index.tz_localize("UTC")
-        else:  # "mt4_utc3" — MT4 broker time
-            df.index = df.index.tz_localize(pytz.FixedOffset(180))
-        df = df[df.index.notna()]   # drop rare DST-fold ambiguous rows
+        broker_tz = pytz.FixedOffset(180)
+        df.index  = df.index.tz_localize(broker_tz)
 
     df.index.name = "Datetime"
     return df
@@ -800,23 +790,21 @@ def main():
 
         # Data
         st.subheader("📊 Data")
-        src = st.radio("Source", ["Upload CSV (MT4 / Barchart)", "yfinance NQ=F (60-day limit)"])
+        src = st.radio("Source", [
+            "Upload MT4 CSV",
+            "Upload Dukascopy CSV",
+            "yfinance NQ=F (60-day limit)",
+        ])
         uploaded = None
-        tz_mode  = "mt4_utc3"
-        if src == "Upload CSV (MT4 / Barchart)":
-            st.caption("MT4 → Tools → History Center → NDX100,M1 → Export, "
-                       "or a Barchart.com intraday history download")
-            uploaded = st.file_uploader("Intraday M1 CSV", type=["csv","txt"])
-            tz_label = st.selectbox(
-                "CSV timestamp timezone",
-                ["MT4 broker (UTC+3)", "US Eastern (ET)", "US Central (CT)", "UTC"],
-                index=0,
-                help="What timezone are the raw timestamps in your file already in? "
-                     "MT4 exports are broker time (usually UTC+3). Barchart.com intraday "
-                     "exports are typically Eastern Time — check the download page if unsure.",
+        if src == "Upload MT4 CSV":
+            st.caption("MT4 → Tools → History Center → NDX100,M1 → Export")
+            uploaded = st.file_uploader("NDX100 M1 CSV", type=["csv","txt"])
+        elif src == "Upload Dukascopy CSV":
+            st.caption(
+                "From widgets.dukascopy.com → USATECH.IDX/USD → 1 min → "
+                "select date range → Download CSV"
             )
-            tz_mode = {"MT4 broker (UTC+3)": "mt4_utc3", "US Eastern (ET)": "et",
-                       "US Central (CT)": "ct", "UTC": "utc"}[tz_label]
+            uploaded = st.file_uploader("Dukascopy USATECH M1 CSV", type=["csv","txt"])
         else:
             st.info("NQ=F at 5m — limited history but works for quick tests")
 
@@ -898,11 +886,11 @@ def main():
     # ── LOAD DATA ─────────────────────────────────────────────────────────────
     with st.spinner("Loading data…"):
         try:
-            if src == "Upload CSV (MT4 / Barchart)":
+            if src in ("Upload MT4 CSV", "Upload Dukascopy CSV"):
                 if uploaded is None:
                     st.error("Please upload a CSV file.")
                     return
-                data = load_csv(uploaded, tz_mode)
+                data = load_csv(uploaded)
             else:
                 import yfinance as yf
                 raw  = yf.Ticker("NQ=F").history(period="60d", interval="5m")
@@ -977,6 +965,19 @@ def main():
     oos_parts = [f["blind_trades"] for f in folds if not f["blind_trades"].empty]
     oos_all   = pd.concat(oos_parts).sort_values("entry_time") if oos_parts else pd.DataFrame()
     oos_m     = metrics(oos_all)
+
+    # ── HERMES EXPORT ──────────────────────────────────────────────────────────
+    if not oos_all.empty:
+        hermes_csv = oos_all.to_csv(index=False)
+        st.sidebar.divider()
+        st.sidebar.subheader("U0001F916 Hermes Agent")
+        st.sidebar.download_button(
+            label="⬇️ Export OOS Trade Log (for Hermes)",
+            data=hermes_csv,
+            file_name="hermes_trade_log.csv",
+            mime="text/csv",
+            help="Feed this CSV to hermes.py to generate strategy improvement hypotheses.",
+        )
 
     # Return degradation
     deg = ((trad_m["pnl"] - oos_m["pnl"]) / abs(trad_m["pnl"]) * 100
