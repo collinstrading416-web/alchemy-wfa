@@ -248,7 +248,7 @@ def run_alchemy(df: pd.DataFrame, p: dict) -> pd.DataFrame:
                     h1e = h1_ema_d.get(ts, np.nan)
                     htf_ok = not use_h1 or np.isnan(h1p) or np.isnan(h1e) or h1p > h1e
                     retest_min = ts.hour * 60 + ts.minute - (9 * 60 + 45)
-                    if htf_ok and (2 <= retest_min <= 5):   # Hermes H20260809_2138
+                    if htf_ok:
                         sl_p = entry - sl_pts
                         tp_p = entry + tp_pts
                         pnl, xt, xr = _scan_exit(day_df, ts, "LONG", sl_p, tp_p, sl_pts, tp_pts, lot, dpp, spread_pts)
@@ -274,7 +274,7 @@ def run_alchemy(df: pd.DataFrame, p: dict) -> pd.DataFrame:
                     h1e = h1_ema_d.get(ts, np.nan)
                     htf_ok = not use_h1 or np.isnan(h1p) or np.isnan(h1e) or h1p < h1e
                     retest_min = ts.hour * 60 + ts.minute - (9 * 60 + 45)
-                    if htf_ok and (2 <= retest_min <= 5):   # Hermes H20260809_2138
+                    if htf_ok:
                         sl_p = entry + sl_pts
                         tp_p = entry - tp_pts
                         pnl, xt, xr = _scan_exit(day_df, ts, "SHORT", sl_p, tp_p, sl_pts, tp_pts, lot, dpp, spread_pts)
