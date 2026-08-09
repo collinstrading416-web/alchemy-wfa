@@ -805,6 +805,7 @@ def main():
         st.subheader("📊 Data")
         src = st.radio("Source", [
             "Upload MT4 CSV",
+            "Upload Barchart CSV",
             "Upload Dukascopy CSV",
             "yfinance NQ=F (60-day limit)",
         ])
@@ -822,6 +823,10 @@ def main():
             )
             tz_mode = {"MT4 broker (UTC+3)": "mt4_utc3", "US Eastern (ET)": "et",
                        "US Central (CT)": "ct", "UTC": "utc"}[tz_label]
+        elif src == "Upload Barchart CSV":
+            st.caption("Barchart → Interactive Charts → Export → Intraday CSV  ⚠️ Barchart stamps futures data in CT, not ET")
+            uploaded = st.file_uploader("Barchart NQ M1 CSV", type=["csv","txt"])
+            tz_mode = "ct"
         elif src == "Upload Dukascopy CSV":
             st.caption(
                 "From widgets.dukascopy.com → USATECH.IDX/USD → 1 min → "
@@ -909,11 +914,16 @@ def main():
     # ── LOAD DATA ─────────────────────────────────────────────────────────────
     with st.spinner("Loading data…"):
         try:
-            if src in ("Upload MT4 CSV", "Upload Dukascopy CSV"):
+            if src in ("Upload MT4 CSV", "Upload Barchart CSV", "Upload Dukascopy CSV"):
                 if uploaded is None:
                     st.error("Please upload a CSV file.")
                     return
-                tm = tz_mode if src == "Upload MT4 CSV" else "utc"
+                if src == "Upload Dukascopy CSV":
+                    tm = "utc"
+                elif src == "Upload Barchart CSV":
+                    tm = "ct"
+                else:
+                    tm = tz_mode
                 data = load_csv(uploaded, tz_mode=tm)
             else:
                 import yfinance as yf
