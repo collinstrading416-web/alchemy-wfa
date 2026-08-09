@@ -675,8 +675,8 @@ def walk_forward(df: pd.DataFrame, train_mo: int, blind_mo: int,
 
         tr_mask = (idx.date >= cur) & (idx.date < te)
         bl_mask = (idx.date >= bs)  & (idx.date < be)
-        tr_df   = df[tr_mask.values]
-        bl_df   = df[bl_mask.values]
+        tr_df   = df[tr_mask]
+        bl_df   = df[bl_mask]
 
         if len(tr_df) < 200 or len(bl_df) < 50:
             cur = bs;  continue
