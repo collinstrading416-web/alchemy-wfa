@@ -1,4 +1,3 @@
-# TEST COMMIT
 """
 AlchemySignal V1.5 — Walk-Forward Backtester
 NDX100 OR-1 Setup: Break & Retest + PB1 Sweep & Go
@@ -731,12 +730,11 @@ def walk_forward(df: pd.DataFrame, train_mo: int, blind_mo: int,
 # ─────────────────────────────────────────────────────────────────────────────
 
 def load_csv(uploaded) -> pd.DataFrame:
-    """Parse M1 CSV - supports MT4 (no header, UTC+3) and Dukascopy (header, UTC) formats."""
+    """Parse M1 CSV - MT4 (no header, UTC+3) or Dukascopy (header, UTC) format."""
     raw   = uploaded.read().decode("utf-8", errors="ignore")
     lines = [l for l in raw.splitlines() if l.strip()]
     sep   = "," if "," in lines[0] else "\t"
     has_header = not lines[0][0].isdigit()
-
     if has_header:
         df = pd.read_csv(io.StringIO(raw), sep=sep, header=0)
         df.columns = [c.strip().strip("<>").upper() for c in df.columns]
@@ -755,21 +753,17 @@ def load_csv(uploaded) -> pd.DataFrame:
     else:
         col_names = ["Date", "Time", "Open", "High", "Low", "Close", "Volume"]
         df = pd.read_csv(io.StringIO(raw), sep=sep, header=None, names=col_names)
-
     if "Datetime" in df.columns:
         df.index = pd.to_datetime(df["Datetime"])
     elif "Date" in df.columns and "Time" in df.columns:
         df.index = pd.to_datetime(df["Date"].astype(str) + " " + df["Time"].astype(str))
     else:
         df.index = pd.to_datetime(df.iloc[:, 0])
-
     want = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in df.columns]
     df   = df[want].apply(pd.to_numeric, errors="coerce").dropna().sort_index()
-
     if df.index.tz is None:
         broker_tz = pytz.FixedOffset(180)
         df.index  = df.index.tz_localize(broker_tz)
-
     df.index.name = "Datetime"
     return df
 
