@@ -729,12 +729,21 @@ def walk_forward(df: pd.DataFrame, train_mo: int, blind_mo: int,
 # DATA LOADER
 # ─────────────────────────────────────────────────────────────────────────────
 
-def load_csv(uploaded) -> pd.DataFrame:
-    """Parse M1 CSV - MT4 (no header, UTC+3) or Dukascopy (header, UTC) format."""
+def load_csv(uploaded, tz_mode: str = "mt4_utc3") -> pd.DataFrame:
+    """
+    Parse M1 CSV — supports two formats:
+
+    A) MT4 / Barchart export (no header, or standard Date+Time header):
+         Localised using tz_mode param (broker UTC+3, ET, CT, or UTC).
+
+    B) Dukascopy export (header contains "Etc/UTC" or ISO timestamps with +00:00):
+         Timestamps already carry tz info — no manual localisation needed.
+    """
     raw   = uploaded.read().decode("utf-8", errors="ignore")
     lines = [l for l in raw.splitlines() if l.strip()]
     sep   = "," if "," in lines[0] else "\t"
     has_header = not lines[0][0].isdigit()
+
     if has_header:
         df = pd.read_csv(io.StringIO(raw), sep=sep, header=0)
         df.columns = [c.strip().strip("<>").upper() for c in df.columns]
@@ -753,17 +762,29 @@ def load_csv(uploaded) -> pd.DataFrame:
     else:
         col_names = ["Date", "Time", "Open", "High", "Low", "Close", "Volume"]
         df = pd.read_csv(io.StringIO(raw), sep=sep, header=None, names=col_names)
+
     if "Datetime" in df.columns:
-        df.index = pd.to_datetime(df["Datetime"])
+        df.index = pd.to_datetime(df["Datetime"], utc=True)
     elif "Date" in df.columns and "Time" in df.columns:
         df.index = pd.to_datetime(df["Date"].astype(str) + " " + df["Time"].astype(str))
     else:
-        df.index = pd.to_datetime(df.iloc[:, 0])
+        df.index = pd.to_datetime(df.iloc[:, 0], utc=True)
+
     want = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in df.columns]
     df   = df[want].apply(pd.to_numeric, errors="coerce").dropna().sort_index()
+
+    # Localise only if timestamps carry no tz (Dukascopy already has UTC)
     if df.index.tz is None:
-        broker_tz = pytz.FixedOffset(180)
-        df.index  = df.index.tz_localize(broker_tz)
+        tz_map = {
+            "mt4_utc3": pytz.FixedOffset(180),
+            "et":       pytz.timezone("America/New_York"),
+            "ct":       pytz.timezone("America/Chicago"),
+            "utc":      pytz.UTC,
+        }
+        local_tz = tz_map.get(tz_mode, pytz.FixedOffset(180))
+        df.index  = df.index.tz_localize(local_tz)
+
+    df.index = df.index.tz_convert("UTC")
     df.index.name = "Datetime"
     return df
 
@@ -791,6 +812,16 @@ def main():
         if src == "Upload MT4 CSV":
             st.caption("MT4 → Tools → History Center → NDX100,M1 → Export")
             uploaded = st.file_uploader("NDX100 M1 CSV", type=["csv","txt"])
+            tz_label = st.selectbox(
+                "CSV timestamp timezone",
+                ["MT4 broker (UTC+3)", "US Eastern (ET)", "US Central (CT)", "UTC"],
+                index=0,
+                help="What timezone are the raw timestamps in your file? "
+                     "MT4 exports are broker time (usually UTC+3). "
+                     "Barchart.com intraday exports are typically Eastern Time.",
+            )
+            tz_mode = {"MT4 broker (UTC+3)": "mt4_utc3", "US Eastern (ET)": "et",
+                       "US Central (CT)": "ct", "UTC": "utc"}[tz_label]
         elif src == "Upload Dukascopy CSV":
             st.caption(
                 "From widgets.dukascopy.com → USATECH.IDX/USD → 1 min → "
@@ -882,7 +913,8 @@ def main():
                 if uploaded is None:
                     st.error("Please upload a CSV file.")
                     return
-                data = load_csv(uploaded)
+                tm = tz_mode if src == "Upload MT4 CSV" else "utc"
+                data = load_csv(uploaded, tz_mode=tm)
             else:
                 import yfinance as yf
                 raw  = yf.Ticker("NQ=F").history(period="60d", interval="5m")
