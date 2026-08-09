@@ -730,10 +730,7 @@ def walk_forward(df: pd.DataFrame, train_mo: int, blind_mo: int,
 # ─────────────────────────────────────────────────────────────────────────────
 
 def load_csv(uploaded) -> pd.DataFrame:
-    """
-    Parse M1 CSV - supports MT4 and Dukascopy formats.
-    MT4: no header, broker UTC+3. Dukascopy: has header with UTC timestamps.
-    """
+    """Parse M1 CSV - supports MT4 (no header, UTC+3) and Dukascopy (header, UTC) formats."""
     raw   = uploaded.read().decode("utf-8", errors="ignore")
     lines = [l for l in raw.splitlines() if l.strip()]
     sep   = "," if "," in lines[0] else "\t"
